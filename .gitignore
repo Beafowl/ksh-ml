@@ -4,3 +4,5 @@ out/
 out_smoke/
 runs/
 tools/_sample.json
+export/
+generated/aa_test/nofx.ogg
