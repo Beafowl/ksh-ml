@@ -22,34 +22,69 @@ import torch
 from .model import ChartGPT, Config
 from . import tokenizer as tok
 
-CFG_DROP_ALL = 0.10   # replace level+radar with <uncond> (classifier-free guidance)
-CFG_DROP_AXIS = 0.05  # additionally drop single radar axes (slider independence)
+CFG_DROP_ALL = 0.10    # replace level+radar with <uncond> (classifier-free guidance)
+CFG_DROP_AXIS = 0.05   # additionally drop single radar axes (slider independence)
+AUDIO_DROP = 0.10      # zero the onset features (keeps song-free generation working)
+GRID = 12              # ticks per onset cell (matches the dataset's onset_step)
 
 
 class ChartData:
-    def __init__(self, path: str, ctx: int, val_mod: int = 20):
+    def __init__(self, path: str, ctx: int, audio_dim: int, val_mod: int = 20):
         self.ctx = ctx
+        self.audio_dim = audio_dim
         self.train, self.val = [], []
+        from collections import Counter
+        lvl_count: Counter = Counter()
         with gzip.open(path, "rt", encoding="utf-8") as f:
             for line in f:
                 r = json.loads(line)
-                seq = np.array(tok.encode(r), dtype=np.int16)
+                tokens, ticks = tok.encode_with_ticks(r)
+                onset = None
+                if r.get("onset"):
+                    # pad with the lookahead window so indexing past the end is silent
+                    onset = np.concatenate([
+                        np.asarray(r["onset"], dtype=np.float32),
+                        np.zeros(audio_dim, dtype=np.float32)])
+                item = {
+                    "seq": np.array(tokens, dtype=np.int16),
+                    "ticks": np.array(ticks, dtype=np.int32),
+                    "onset": onset,
+                    "level": int(r["level"]) or 1,
+                }
                 key = r["music_id"] if r["music_id"] is not None else hash(r["title"])
-                (self.val if key % val_mod == 0 else self.train).append(seq)
-        self.weights = np.array([len(s) for s in self.train], dtype=np.float64)
+                if key % val_mod == 0:
+                    self.val.append(item)
+                else:
+                    self.train.append(item)
+                    lvl_count[item["level"]] += 1
+        # length-weighted, flattened across levels so the easy end isn't drowned
+        self.weights = np.array(
+            [len(it["seq"]) / math.sqrt(lvl_count[it["level"]]) for it in self.train],
+            dtype=np.float64)
         self.weights /= self.weights.sum()
+        self.cum_weights = np.cumsum(self.weights)
+
+    def _audio_feats(self, item, ticks: np.ndarray) -> np.ndarray:
+        if item["onset"] is None:
+            return np.zeros((len(ticks), self.audio_dim), dtype=np.float32)
+        cells = (ticks // GRID)[:, None] + np.arange(self.audio_dim)[None, :]
+        cells = np.minimum(cells, len(item["onset"]) - 1)
+        return item["onset"][cells]
 
     def sample_batch(self, batch: int, rng: random.Random, train=True):
-        seqs = self.train if train else self.val
-        xs, ys = [], []
+        items = self.train if train else self.val
+        xs, ys, aus = [], [], []
         for _ in range(batch):
             if train:
-                i = np.searchsorted(np.cumsum(self.weights), rng.random())
-                i = min(i, len(seqs) - 1)
+                i = int(np.searchsorted(self.cum_weights, rng.random()))
+                i = min(i, len(items) - 1)
             else:
-                i = rng.randrange(len(seqs))
-            s = seqs[i].astype(np.int64)
+                i = rng.randrange(len(items))
+            it = items[i]
+            s = it["seq"].astype(np.int64)
+            tk = it["ticks"]
             prefix, body = s[:tok.PREFIX_LEN].copy(), s[tok.PREFIX_LEN:]
+            tk_prefix, tk_body = tk[:tok.PREFIX_LEN], tk[tok.PREFIX_LEN:]
             if train:  # classifier-free guidance dropout
                 if rng.random() < CFG_DROP_ALL:
                     prefix[1:1 + 7] = tok.UNCOND  # level + radar
@@ -61,15 +96,23 @@ class ChartData:
             if len(body) > body_ctx:
                 start = rng.randrange(len(body) - body_ctx + 1) if train else 0
                 body = body[start:start + body_ctx]
+                tk_body = tk_body[start:start + body_ctx]
             x = np.concatenate([prefix, body])
+            ticks_x = np.concatenate([tk_prefix, tk_body])
             pad = self.ctx + 1 - len(x)
             if pad > 0:
                 x = np.concatenate([x, np.full(pad, tok.PAD, dtype=np.int64)])
+                ticks_x = np.concatenate([ticks_x, np.full(pad, ticks_x[-1], dtype=np.int32)])
+            au = self._audio_feats(it, ticks_x[:-1])
+            if train and rng.random() < AUDIO_DROP:
+                au = np.zeros_like(au)
             xs.append(x[:-1])
             y = x[1:].copy()
             y[y == tok.PAD] = -100
             ys.append(y)
-        return (torch.from_numpy(np.stack(xs)), torch.from_numpy(np.stack(ys)))
+            aus.append(au)
+        return (torch.from_numpy(np.stack(xs)), torch.from_numpy(np.stack(ys)),
+                torch.from_numpy(np.stack(aus)))
 
 
 def main():
@@ -88,6 +131,7 @@ def main():
     ap.add_argument("--n-head", type=int, default=6)
     ap.add_argument("--n-embd", type=int, default=384)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--audio-dim", type=int, default=16, help="onset lookahead cells; 0 disables audio")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--compile", action="store_true")
@@ -101,13 +145,14 @@ def main():
     rng = random.Random(args.seed)
 
     print("loading + tokenizing dataset ...")
-    data = ChartData(args.data, args.ctx)
-    n_tok = sum(len(s) for s in data.train)
+    data = ChartData(args.data, args.ctx, args.audio_dim)
+    n_tok = sum(len(it["seq"]) for it in data.train)
     print(f"  train charts: {len(data.train)} ({n_tok/1e6:.1f}M tokens), "
           f"val charts: {len(data.val)}, vocab: {len(tok.VOCAB)}")
 
     cfg = Config(vocab_size=len(tok.VOCAB), ctx=args.ctx, n_layer=args.n_layer,
-                 n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout)
+                 n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout,
+                 audio_dim=args.audio_dim)
     model = ChartGPT(cfg).to(device)
     print(f"  model params: {model.num_params()/1e6:.1f}M")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -146,10 +191,10 @@ def main():
         vrng = random.Random(0)
         losses = []
         for _ in range(args.eval_batches):
-            x, y = data.sample_batch(args.batch, vrng, train=False)
-            x, y = x.to(device), y.to(device)
+            x, y, a = data.sample_batch(args.batch, vrng, train=False)
+            x, y, a = x.to(device), y.to(device), a.to(device)
             with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
-                _, loss = model(x, y)
+                _, loss = model(x, y, audio=a)
             losses.append(loss.item())
         model.train()
         return sum(losses) / len(losses)
@@ -162,10 +207,10 @@ def main():
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for _ in range(args.accum):
-            x, y = data.sample_batch(args.batch, rng)
-            x, y = x.to(device), y.to(device)
+            x, y, a = data.sample_batch(args.batch, rng)
+            x, y, a = x.to(device), y.to(device), a.to(device)
             with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
-                _, loss = model(x, y)
+                _, loss = model(x, y, audio=a)
             (loss / args.accum).backward()
             total += loss.item() / args.accum
             tok_count += x.numel()

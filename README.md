@@ -63,7 +63,18 @@ python -m sdvx_model.sample --ckpt runs/base/best.pt --out gen.ksh ^
 Drag the resulting .ksh into the editor to inspect it. `--guidance 1.0`
 disables slider steering (pure unconditional style); 2-3 pushes harder.
 
+## Phase 3 — audio conditioning
+
+The model receives a 16-cell onset-strength lookahead (one measure at 1/16)
+aligned to every token's tick position, so note placement follows the song.
+Audio features are dropped for 10% of training samples, so generation without
+a song still works. Training also flattens the level distribution (sqrt
+inverse frequency) so low levels aren't drowned out by the 15+ majority.
+
+Train:  python -m sdvx_model.train --data out/charts.jsonl.gz --out runs/audio
+Sample with a song:  add  --audio song.ogg --offset <ms of beat 1>  to
+sdvx_model.sample (assumes constant --bpm). Without --audio: pattern-only.
+
 ## Later phases (planned)
 
-3. Audio conditioning (per-measure onset features are already in the dataset)
 4. ONNX export + in-editor generation dialog

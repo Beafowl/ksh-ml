@@ -17,6 +17,7 @@ class Config:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.1
+    audio_dim: int = 16  # onset-strength lookahead window (1/16 cells); 0 = no audio
 
 
 class Block(nn.Module):
@@ -56,6 +57,7 @@ class ChartGPT(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, cfg.ctx, cfg.n_embd))
+        self.audio_proj = nn.Linear(cfg.audio_dim, cfg.n_embd, bias=False) if cfg.audio_dim else None
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
@@ -71,9 +73,12 @@ class ChartGPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, audio=None):
         b, t = idx.shape
-        x = self.drop(self.tok_emb(idx) + self.pos_emb[:, :t])
+        x = self.tok_emb(idx) + self.pos_emb[:, :t]
+        if audio is not None and self.audio_proj is not None:
+            x = x + self.audio_proj(audio)
+        x = self.drop(x)
         for blk in self.blocks:
             x = blk(x)
         x = self.ln_f(x)
@@ -89,11 +94,13 @@ class ChartGPT(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     @torch.no_grad()
-    def generate_step(self, idx, temperature=1.0, top_p=0.95, guidance=None):
+    def generate_step(self, idx, temperature=1.0, top_p=0.95, guidance=None, audio=None):
         """One sampling step. idx: (B, T). With guidance, row 0 is conditional
         and row 1 unconditional; returns the next token id (int)."""
         idx = idx[:, -self.cfg.ctx:]
-        logits, _ = self(idx)
+        if audio is not None:
+            audio = audio[:, -self.cfg.ctx:]
+        logits, _ = self(idx, audio=audio)
         logits = logits[:, -1, :]
         if guidance is not None and logits.size(0) == 2:
             logits = logits[1] + guidance * (logits[0] - logits[1])

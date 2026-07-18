@@ -71,20 +71,6 @@ def cond_tokens(level: float, radar: dict | None, bpm: float) -> list[int]:
     return out
 
 
-def _emit_advance(out: list[int], pos: int, tick: int) -> int:
-    while pos < tick:
-        next_bar = (pos // MEASURE + 1) * MEASURE
-        if tick >= next_bar:
-            out.append(ID["bar"])
-            pos = next_bar
-            continue
-        gap = tick - pos
-        d = max(n for n in DELTAS if n <= gap)
-        out.append(ID[f"d_{d}"])
-        pos += d
-    return pos
-
-
 def encode_body(chart: dict) -> list[int]:
     """chart: the dataset record's 'chart' dict (bpms/bt/fx/lasers)."""
     ev: list[tuple[int, int, list[int]]] = []  # (tick, priority, tokens)
@@ -115,18 +101,39 @@ def encode_body(chart: dict) -> list[int]:
             ev.append((pts[-1][0], 6, [ID[f"la_off_{s}"]]))
     ev.sort(key=lambda e: (e[0], e[1]))
     out: list[int] = []
+    ticks: list[int] = []  # tick position AFTER each token (audio alignment)
     pos = 0
     for tick, _, tokens in ev:
-        pos = _emit_advance(out, pos, tick)
-        out.extend(tokens)
-    return out
+        while pos < tick:
+            next_bar = (pos // MEASURE + 1) * MEASURE
+            if tick >= next_bar:
+                pos = next_bar
+                out.append(ID["bar"])
+            else:
+                gap = tick - pos
+                d = max(n for n in DELTAS if n <= gap)
+                pos += d
+                out.append(ID[f"d_{d}"])
+            ticks.append(pos)
+        for t in tokens:
+            out.append(t)
+            ticks.append(pos)
+    return (out, ticks)
 
 
 def encode(record: dict) -> list[int]:
+    tokens, _ = encode_with_ticks(record)
+    return tokens
+
+
+def encode_with_ticks(record: dict) -> tuple[list[int], list[int]]:
+    """-> (tokens, tick-after-token); prefix/EOS positions are 0/end."""
     bpm = record["bpm"][1] or record["chart"]["bpms"][0][1]
     radar = record["radar"] if record.get("labeled") else None
-    return ([BOS] + cond_tokens(record["level"], radar, bpm)
-            + encode_body(record["chart"]) + [EOS])
+    body, bticks = encode_body(record["chart"])
+    tokens = [BOS] + cond_tokens(record["level"], radar, bpm) + body + [EOS]
+    ticks = [0] * PREFIX_LEN + bticks + [bticks[-1] if bticks else 0]
+    return tokens, ticks
 
 
 def decode_body(tokens: list[int]) -> dict:
@@ -229,7 +236,7 @@ def _gcd(a, b):
 
 
 def chart_to_ksh(chart: dict, title="generated", difficulty="infinite",
-                 level=15, bpm=None, music_file="") -> str:
+                 level=15, bpm=None, music_file="", offset_ms=0) -> str:
     bpms = chart["bpms"]
     if bpm is not None:
         bpms = [[0, float(bpm)]] + [b for b in bpms[1:]]
@@ -285,7 +292,7 @@ def chart_to_ksh(chart: dict, title="generated", difficulty="infinite",
     lines = [
         f"title={title}", "artist=sdvx-ml", "effect=sdvx-ml", "jacket=",
         "illustrator=", f"difficulty={difficulty}", f"level={max(1, min(20, int(level)))}",
-        f"t={head_bpm:g}", f"m={music_file}", "mvol=75", "o=0", "bg=desert",
+        f"t={head_bpm:g}", f"m={music_file}", "mvol=75", f"o={int(offset_ms)}", "bg=desert",
         "layer=arrow", "po=0", "plength=15000", "pfiltergain=50", "filtertype=peak",
         "chokkakuautovol=0", "chokkakuvol=50", "ver=171", "--",
     ]
