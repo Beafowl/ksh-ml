@@ -25,7 +25,35 @@ from . import tokenizer as tok
 CFG_DROP_ALL = 0.10    # replace level+radar with <uncond> (classifier-free guidance)
 CFG_DROP_AXIS = 0.05   # additionally drop single radar axes (slider independence)
 AUDIO_DROP = 0.10      # zero the onset features (keeps song-free generation working)
+MIRROR_P = 0.50        # lane-mirror augmentation (radar labels are symmetric)
 GRID = 12              # ticks per onset cell (matches the dataset's onset_step)
+WINDOW = 16            # onset cells of lookahead per token
+
+
+def _mirror_perm() -> np.ndarray:
+    """Token permutation for the lane-mirrored chart: BT ABCD->DCBA, FX L<->R,
+    lasers swap sides and flip values (v -> 50-v)."""
+    perm = np.arange(len(tok.VOCAB), dtype=np.int64)
+    for name, i in ((n, tok.ID[n]) for n in tok.VOCAB):
+        m = None
+        if name.startswith("bt_"):
+            kind, lane = name.rsplit("_", 1)
+            m = f"{kind}_{3 - int(lane)}"
+        elif name.startswith("fx_"):
+            kind, side = name.rsplit("_", 1)
+            m = f"{kind}_{1 - int(side)}"
+        elif name.startswith("la_v_"):
+            _, _, side, v = name.split("_")
+            m = f"la_v_{1 - int(side)}_{50 - int(v)}"
+        elif name.startswith(("la_on_", "la_wide_", "la_off_")):
+            kind, side = name.rsplit("_", 1)
+            m = f"{kind}_{1 - int(side)}"
+        if m is not None:
+            perm[i] = tok.ID[m]
+    return perm
+
+
+MIRROR = _mirror_perm()
 
 
 class ChartData:
@@ -41,10 +69,13 @@ class ChartData:
                 tokens, ticks = tok.encode_with_ticks(r)
                 onset = None
                 if r.get("onset"):
+                    arr = np.asarray(r["onset"], dtype=np.float32)
+                    if arr.ndim == 1:  # v1 datasets: scalar onset per cell
+                        arr = arr[:, None]
                     # pad with the lookahead window so indexing past the end is silent
-                    onset = np.concatenate([
-                        np.asarray(r["onset"], dtype=np.float32),
-                        np.zeros(audio_dim, dtype=np.float32)])
+                    onset = np.concatenate([arr, np.zeros((WINDOW, arr.shape[1]), dtype=np.float32)])
+                    assert WINDOW * arr.shape[1] == audio_dim, (
+                        f"--audio-dim must be {WINDOW * arr.shape[1]} for this dataset")
                 item = {
                     "seq": np.array(tokens, dtype=np.int16),
                     "ticks": np.array(ticks, dtype=np.int32),
@@ -67,9 +98,9 @@ class ChartData:
     def _audio_feats(self, item, ticks: np.ndarray) -> np.ndarray:
         if item["onset"] is None:
             return np.zeros((len(ticks), self.audio_dim), dtype=np.float32)
-        cells = (ticks // GRID)[:, None] + np.arange(self.audio_dim)[None, :]
+        cells = (ticks // GRID)[:, None] + np.arange(WINDOW)[None, :]
         cells = np.minimum(cells, len(item["onset"]) - 1)
-        return item["onset"][cells]
+        return item["onset"][cells].reshape(len(ticks), -1)
 
     def sample_batch(self, batch: int, rng: random.Random, train=True):
         items = self.train if train else self.val
@@ -82,6 +113,8 @@ class ChartData:
                 i = rng.randrange(len(items))
             it = items[i]
             s = it["seq"].astype(np.int64)
+            if train and rng.random() < MIRROR_P:
+                s = MIRROR[s]
             tk = it["ticks"]
             prefix, body = s[:tok.PREFIX_LEN].copy(), s[tok.PREFIX_LEN:]
             tk_prefix, tk_body = tk[:tok.PREFIX_LEN], tk[tok.PREFIX_LEN:]
@@ -131,7 +164,7 @@ def main():
     ap.add_argument("--n-head", type=int, default=6)
     ap.add_argument("--n-embd", type=int, default=384)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--audio-dim", type=int, default=16, help="onset lookahead cells; 0 disables audio")
+    ap.add_argument("--audio-dim", type=int, default=64, help="16 cells x features/cell; 0 disables audio")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--compile", action="store_true")

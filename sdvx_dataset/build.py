@@ -22,7 +22,7 @@ import numpy as np
 
 from . import ksh, music_db
 from .matching import TitleIndex, ksh_max_bpm
-from .onsets import grid_onsets, onset_envelope
+from .onsets import FEATS, grid_features, onset_features
 
 GRID_STEP = 12  # ticks per onset cell (1/16 note)
 
@@ -169,6 +169,7 @@ def collect(charts_root: str, index: TitleIndex, aliases: dict, limit: int | Non
                     "audio": f"{song_key}/{audio}" if audio else None,
                     "onset": None,
                     "onset_step": GRID_STEP,
+                    "onset_feats": FEATS,
                     "_grid_ms": None if not audio else _grid_ms(chart, end),
                 })
     return records, stats, unmatched, parse_errors
@@ -183,9 +184,9 @@ def _audio_task(args):
     path, jobs = args  # jobs: [(chart_id, grid_ms list)]
     out = []
     try:
-        env, fps = onset_envelope(path)
+        feats, fps = onset_features(path)
         for cid, grid in jobs:
-            vals = grid_onsets(env, fps, np.asarray(grid, dtype=np.float64))
+            vals = grid_features(feats, fps, np.asarray(grid, dtype=np.float64))
             out.append((cid, np.round(vals, 3).tolist()))
     except Exception as e:  # noqa: BLE001
         out = [(cid, None) for cid, _ in jobs]
