@@ -57,9 +57,15 @@ MIRROR = _mirror_perm()
 
 
 class ChartData:
-    def __init__(self, path: str, ctx: int, audio_dim: int, val_mod: int = 20):
+    def __init__(self, path: str, ctx: int, audio_dim: int, val_mod: int = 20,
+                 mel_pack: str | None = None):
         self.ctx = ctx
         self.audio_dim = audio_dim
+        self.mels = None
+        if mel_pack:
+            z = np.load(mel_pack)
+            self.mels = {k: z[k] for k in z.files}  # id("|"-separated) -> (cells, 64) u8
+            print(f"  mel pack: {len(self.mels)} charts")
         self.train, self.val = [], []
         from collections import Counter
         lvl_count: Counter = Counter()
@@ -68,7 +74,12 @@ class ChartData:
                 r = json.loads(line)
                 tokens, ticks = tok.encode_with_ticks(r)
                 onset = None
-                if r.get("onset"):
+                if self.mels is not None:
+                    mel = self.mels.get(r["id"].replace("/", "|"))
+                    if mel is not None:
+                        onset = np.concatenate(
+                            [mel, np.zeros((WINDOW, mel.shape[1]), dtype=np.uint8)])
+                elif r.get("onset"):
                     arr = np.asarray(r["onset"], dtype=np.float32)
                     if arr.ndim == 1:  # v1 datasets: scalar onset per cell
                         arr = arr[:, None]
@@ -100,7 +111,10 @@ class ChartData:
             return np.zeros((len(ticks), self.audio_dim), dtype=np.float32)
         cells = (ticks // GRID)[:, None] + np.arange(WINDOW)[None, :]
         cells = np.minimum(cells, len(item["onset"]) - 1)
-        return item["onset"][cells].reshape(len(ticks), -1)
+        out = item["onset"][cells].reshape(len(ticks), -1)
+        if out.dtype == np.uint8:
+            out = out.astype(np.float32) / 255.0
+        return out
 
     def sample_batch(self, batch: int, rng: random.Random, train=True):
         items = self.train if train else self.val
@@ -165,6 +179,8 @@ def main():
     ap.add_argument("--n-embd", type=int, default=384)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--audio-dim", type=int, default=64, help="16 cells x features/cell; 0 disables audio")
+    ap.add_argument("--mel-pack", default=None,
+                    help="mels.npz from the dataset build; switches to the learned mel encoder (audio-dim becomes 16*64)")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--compile", action="store_true")
@@ -178,14 +194,16 @@ def main():
     rng = random.Random(args.seed)
 
     print("loading + tokenizing dataset ...")
-    data = ChartData(args.data, args.ctx, args.audio_dim)
+    if args.mel_pack:
+        args.audio_dim = WINDOW * 64
+    data = ChartData(args.data, args.ctx, args.audio_dim, mel_pack=args.mel_pack)
     n_tok = sum(len(it["seq"]) for it in data.train)
     print(f"  train charts: {len(data.train)} ({n_tok/1e6:.1f}M tokens), "
           f"val charts: {len(data.val)}, vocab: {len(tok.VOCAB)}")
 
     cfg = Config(vocab_size=len(tok.VOCAB), ctx=args.ctx, n_layer=args.n_layer,
                  n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout,
-                 audio_dim=args.audio_dim)
+                 audio_dim=args.audio_dim, mel_bins=64 if args.mel_pack else 0)
     model = ChartGPT(cfg).to(device)
     print(f"  model params: {model.num_params()/1e6:.1f}M")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,

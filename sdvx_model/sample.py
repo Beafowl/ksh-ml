@@ -26,12 +26,17 @@ WINDOW = 16
 
 
 def song_features(path: str, bpm: float, offset_ms: float, n_cells: int, feats_per_cell: int):
-    from sdvx_dataset.onsets import grid_features, grid_onsets, onset_envelope, onset_features
     grid_ms = offset_ms + np.arange(n_cells, dtype=np.float64) * (15000.0 / bpm)
-    if feats_per_cell == 1:
+    if feats_per_cell == 64:
+        from sdvx_dataset.mel import grid_mel_u8, mel_frames
+        mel, fps = mel_frames(path)
+        vals = grid_mel_u8(mel, fps, grid_ms).astype(np.float32) / 255.0
+    elif feats_per_cell == 1:
+        from sdvx_dataset.onsets import grid_onsets, onset_envelope
         env, fps = onset_envelope(path)
         vals = grid_onsets(env, fps, grid_ms).astype(np.float32)[:, None]
     else:
+        from sdvx_dataset.onsets import grid_features, onset_features
         feats, fps = onset_features(path)
         vals = grid_features(feats, fps, grid_ms).astype(np.float32)
     return np.concatenate([vals, np.zeros((WINDOW, vals.shape[1]), dtype=np.float32)])

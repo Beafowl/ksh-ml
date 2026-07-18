@@ -22,6 +22,7 @@ import numpy as np
 
 from . import ksh, music_db
 from .matching import TitleIndex, ksh_max_bpm
+from .mel import N_MELS, grid_mel_u8, mel_frames
 from .onsets import FEATS, grid_features, onset_features
 
 GRID_STEP = 12  # ticks per onset cell (1/16 note)
@@ -185,11 +186,13 @@ def _audio_task(args):
     out = []
     try:
         feats, fps = onset_features(path)
+        mels, mfps = mel_frames(path)
         for cid, grid in jobs:
-            vals = grid_features(feats, fps, np.asarray(grid, dtype=np.float64))
-            out.append((cid, np.round(vals, 3).tolist()))
+            g = np.asarray(grid, dtype=np.float64)
+            vals = grid_features(feats, fps, g)
+            out.append((cid, np.round(vals, 3).tolist(), grid_mel_u8(mels, mfps, g)))
     except Exception as e:  # noqa: BLE001
-        out = [(cid, None) for cid, _ in jobs]
+        out = [(cid, None, None) for cid, _ in jobs]
         return out, f"{path}: {e!r}"
     return out, None
 
@@ -204,14 +207,17 @@ def run_audio(records, charts_root, workers):
     by_id = {r["id"]: r for r in records}
     tasks = list(by_audio.items())
     failures = []
+    mels = {}
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for out, err in tqdm(ex.map(_audio_task, tasks, chunksize=4),
                              total=len(tasks), desc="audio", unit="file"):
             if err:
                 failures.append(err)
-            for cid, vals in out:
+            for cid, vals, mel in out:
                 by_id[cid]["onset"] = vals
-    return failures
+                if mel is not None:
+                    mels[cid.replace("/", "|")] = mel
+    return failures, mels
 
 
 def main():
@@ -240,9 +246,13 @@ def main():
     print("parsing charts ...")
     records, stats, unmatched, parse_errors = collect(args.charts, index, aliases, args.limit)
 
-    audio_failures = []
+    audio_failures, mels = [], {}
     if not args.no_audio:
-        audio_failures = run_audio(records, args.charts, args.workers)
+        audio_failures, mels = run_audio(records, args.charts, args.workers)
+    if mels:
+        np.savez_compressed(os.path.join(args.out, "mels.npz"), **mels)
+        print(f"wrote mels.npz ({len(mels)} charts, "
+              f"{sum(m.nbytes for m in mels.values()) / 1e6:.0f} MB raw)")
 
     out_path = os.path.join(args.out, "charts.jsonl.gz")
     with gzip.open(out_path, "wt", encoding="utf-8") as f:

@@ -17,7 +17,9 @@ class Config:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.1
-    audio_dim: int = 16  # onset-strength lookahead window (1/16 cells); 0 = no audio
+    audio_dim: int = 16   # flattened per-token audio input; 0 = no audio
+    mel_bins: int = 0     # >0: input is (window x mel_bins) and a learned
+                          # per-cell encoder replaces the flat projection
 
 
 class Block(nn.Module):
@@ -67,7 +69,19 @@ class ChartGPT(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, cfg.ctx, cfg.n_embd))
-        self.audio_proj = nn.Linear(cfg.audio_dim, cfg.n_embd, bias=False) if cfg.audio_dim else None
+        if cfg.mel_bins:
+            # learned audio encoder: shared per-cell MLP over mel bins, then a
+            # projection over the flattened lookahead window
+            cells = cfg.audio_dim // cfg.mel_bins
+            self.audio_proj = nn.Sequential(
+                nn.Unflatten(-1, (cells, cfg.mel_bins)),
+                nn.Linear(cfg.mel_bins, 32),
+                nn.GELU(),
+                nn.Flatten(-2),
+                nn.Linear(cells * 32, cfg.n_embd, bias=False),
+            )
+        else:
+            self.audio_proj = nn.Linear(cfg.audio_dim, cfg.n_embd, bias=False) if cfg.audio_dim else None
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)

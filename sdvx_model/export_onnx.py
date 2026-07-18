@@ -50,7 +50,7 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="chartgen.onnx")
     ap.add_argument("--fp16", action="store_true",
-                    help="convert weights to fp16 (I/O stays fp32; halves the file)")
+                    help="full fp16 graph (float I/O becomes fp16; halves the file)")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")
@@ -91,11 +91,12 @@ def main():
         import onnx
         from onnxconverter_common import float16
         m = onnx.load(args.out)
-        m = float16.convert_float_to_float16(m, keep_io_types=True)
+        m = float16.convert_float_to_float16(m, keep_io_types=False)
         onnx.save(m, args.out)
 
     meta = {
         "vocab": tok.VOCAB,
+        "fp16": bool(args.fp16),
         "model_cfg": cfg.__dict__,
         "n_layer": nl, "n_head": nh, "head_dim": hd,
         "prefix_len": tok.PREFIX_LEN,
@@ -111,21 +112,25 @@ def main():
     import onnxruntime as ort
     sess = ort.InferenceSession(args.out, providers=["CPUExecutionProvider"])
 
+    ftype = np.float16 if args.fp16 else np.float32
+
     def run(idx_t, audio_t, mask_t, past_t):
-        feeds = {"idx": idx_t.numpy(), "audio": audio_t.numpy(), "mask": mask_t.numpy()}
+        feeds = {"idx": idx_t.numpy(),
+                 "audio": audio_t.numpy().astype(ftype),
+                 "mask": mask_t.numpy().astype(ftype)}
         for i in range(nl):
-            feeds[f"past_k_{i}"] = past_t[2 * i].numpy()
-            feeds[f"past_v_{i}"] = past_t[2 * i + 1].numpy()
+            feeds[f"past_k_{i}"] = past_t[2 * i].numpy().astype(ftype)
+            feeds[f"past_v_{i}"] = past_t[2 * i + 1].numpy().astype(ftype)
         return sess.run(None, feeds)
 
     with torch.no_grad():
         ref = wrapper(idx, audio, mask, *past)
     out = run(idx, audio, mask, past)
-    err = np.abs(ref[0].numpy() - out[0]).max()
+    err = np.abs(ref[0].numpy() - out[0].astype(np.float32)).max()
     print(f"prefill parity: max |dlogits| = {err:.2e}")
 
     # one incremental step reusing the cache
-    past2 = [torch.from_numpy(o) for o in out[1:]]
+    past2 = [torch.from_numpy(o.astype(np.float32)) for o in out[1:]]
     idx2 = torch.randint(4, cfg.vocab_size, (b, 1))
     audio2 = torch.rand(b, 1, cfg.audio_dim)
     mask2 = causal_mask(1, s, b)
@@ -133,9 +138,9 @@ def main():
         ref2 = wrapper(idx2, audio2, mask2,
                        *[t for t in past2])
     out2 = run(idx2, audio2, mask2, past2)
-    err2 = np.abs(ref2[0].numpy() - out2[0]).max()
+    err2 = np.abs(ref2[0].numpy() - out2[0].astype(np.float32)).max()
     print(f"step parity:    max |dlogits| = {err2:.2e}")
-    tol = 5e-2 if args.fp16 else 1e-3  # fp16 rounding is fine at logit scale
+    tol = 1e-1 if args.fp16 else 1e-3  # fp16 rounding is fine at logit scale
     assert err < tol and err2 < tol, "ONNX export diverges from torch"
     import os
     print(f"exported {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB) — OK")
