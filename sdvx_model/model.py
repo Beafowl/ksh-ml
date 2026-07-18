@@ -35,20 +35,30 @@ class Block(nn.Module):
         self.n_head = cfg.n_head
         self.dropout = cfg.dropout
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, attn_mask=None):
+        """past_kv: optional (k, v) each (B, nh, P, hd) for incremental decoding.
+        attn_mask: optional additive float mask (B or 1, 1, T, P+T); when
+        neither is given the standard causal mask applies. Returns
+        (x, (k, v)) with the mask-free training path unchanged."""
         b, t, c = x.shape
         h = self.ln1(x)
         q, k, v = self.qkv(h).split(c, dim=2)
         q = q.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
         k = k.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
         v = v.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
-        a = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0)
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+        if attn_mask is not None:
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            a = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0)
         a = a.transpose(1, 2).contiguous().view(b, t, c)
         x = x + self.proj(a)
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, (k, v)
 
 
 class ChartGPT(nn.Module):
@@ -80,7 +90,7 @@ class ChartGPT(nn.Module):
             x = x + self.audio_proj(audio)
         x = self.drop(x)
         for blk in self.blocks:
-            x = blk(x)
+            x, _ = blk(x)
         x = self.ln_f(x)
         logits = self.head(x)
         loss = None
@@ -92,6 +102,22 @@ class ChartGPT(nn.Module):
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def forward_kv(self, idx, audio, attn_mask, past):
+        """Incremental forward for export/inference. idx (B,S); audio (B,S,A);
+        attn_mask additive (B,1,S,P+S); past: list of n_layer (k,v) tensors
+        with P=0 allowed. Returns (logits, presents)."""
+        b, s = idx.shape
+        p = past[0][0].shape[2]
+        x = self.tok_emb(idx) + self.pos_emb[:, p:p + s]
+        if audio is not None and self.audio_proj is not None:
+            x = x + self.audio_proj(audio)
+        presents = []
+        for blk, pkv in zip(self.blocks, past):
+            x, kv = blk(x, past_kv=pkv, attn_mask=attn_mask)
+            presents.append(kv)
+        x = self.ln_f(x)
+        return self.head(x), presents
 
     @torch.no_grad()
     def generate_step(self, idx, temperature=1.0, top_p=0.95, guidance=None, audio=None):
