@@ -1,0 +1,17 @@
+== dataset report ==
+songs scanned:        2365
+charts kept:          4770  (skipped empty: 0, parse errors: 0)
+matched songs:        exact 2229 / kana 0 / suffix 0 / alias 0 / none 136
+charts with radar:    4490 (94%)
+charts with audio:    4758, onset extracted: 4758
+level label mismatch: 243 (db level used)
+audio failures:       0
+radar axis stats (0-200):
+  notes     min   0  mean   72.6  max 200
+  peak      min   0  mean   83.3  max 193
+  tsumami   min   0  mean   54.9  max 200
+  tricky    min   0  mean   33.9  max 200
+  hand-trip min   0  mean   26.6  max 200
+  one-hand  min   0  mean   57.1  max 200
+level histogram: 1:15 2:52 3:117 4:145 5:166 6:136 7:75 8:96 9:103 10:164 11:164 12:187 13:266 14:211 15:358 16:560 17:773 18:695 19:180 20:27
+total note/laser events: 4141083

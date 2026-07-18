@@ -49,6 +49,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="chartgen.onnx")
+    ap.add_argument("--fp16", action="store_true",
+                    help="convert weights to fp16 (I/O stays fp32; halves the file)")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")
@@ -84,6 +86,13 @@ def main():
         wrapper, (idx, audio, mask, *past), args.out,
         input_names=in_names, output_names=out_names, dynamic_axes=dyn,
         opset_version=17, do_constant_folding=True)
+
+    if args.fp16:
+        import onnx
+        from onnxconverter_common import float16
+        m = onnx.load(args.out)
+        m = float16.convert_float_to_float16(m, keep_io_types=True)
+        onnx.save(m, args.out)
 
     meta = {
         "vocab": tok.VOCAB,
@@ -126,7 +135,8 @@ def main():
     out2 = run(idx2, audio2, mask2, past2)
     err2 = np.abs(ref2[0].numpy() - out2[0]).max()
     print(f"step parity:    max |dlogits| = {err2:.2e}")
-    assert err < 1e-3 and err2 < 1e-3, "ONNX export diverges from torch"
+    tol = 5e-2 if args.fp16 else 1e-3  # fp16 rounding is fine at logit scale
+    assert err < tol and err2 < tol, "ONNX export diverges from torch"
     import os
     print(f"exported {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB) — OK")
 
