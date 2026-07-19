@@ -6,3 +6,5 @@ runs/
 tools/_sample.json
 export/
 generated/aa_test/nofx.ogg
+out_v2/
+out_v3/

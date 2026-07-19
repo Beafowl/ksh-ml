@@ -82,17 +82,18 @@ def main():
         dyn[f"past_k_{i}"] = dyn[f"past_v_{i}"] = {0: "B", 2: "P"}
         dyn[f"pres_k_{i}"] = dyn[f"pres_v_{i}"] = {0: "B", 2: "PS"}
 
+    # fp16: export natively from a half-precision copy (post-hoc converters
+    # mishandle the KV-cache pass-through outputs)
+    export_wrapper, export_inputs = wrapper, (idx, audio, mask, *past)
+    if args.fp16:
+        import copy
+        m16 = copy.deepcopy(model).half()
+        export_wrapper = KVWrapper(m16)
+        export_inputs = (idx, audio.half(), mask.half(), *[t.half() for t in past])
     torch.onnx.export(
-        wrapper, (idx, audio, mask, *past), args.out,
+        export_wrapper, export_inputs, args.out,
         input_names=in_names, output_names=out_names, dynamic_axes=dyn,
         opset_version=17, do_constant_folding=True)
-
-    if args.fp16:
-        import onnx
-        from onnxconverter_common import float16
-        m = onnx.load(args.out)
-        m = float16.convert_float_to_float16(m, keep_io_types=False)
-        onnx.save(m, args.out)
 
     meta = {
         "vocab": tok.VOCAB,
