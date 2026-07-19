@@ -24,6 +24,7 @@ RADAR_BUCKETS = 11        # 0-200 -> 0-10
 BPM_BUCKETS = 64          # log scale 50..400
 DELTAS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 36, 48, 96]
 MEASURE = 192
+EFF_VOCAB = 100           # effector-style slots (top-N effectors by chart count)
 
 
 def _build_vocab() -> list[str]:
@@ -41,15 +42,18 @@ def _build_vocab() -> list[str]:
         v += [f"la_on_{s}", f"la_wide_{s}", f"la_off_{s}"]
         v += [f"la_v_{s}_{i}" for i in range(51)]
     v += ["bpmch"]
+    # appended last so v4 token ids stay stable
+    v += [f"eff_{i}" for i in range(EFF_VOCAB)]
     return v
 
 
 VOCAB = _build_vocab()
 ID = {name: i for i, name in enumerate(VOCAB)}
 PAD, BOS, EOS, UNCOND = ID["<pad>"], ID["<bos>"], ID["<eos>"], ID["<uncond>"]
-COND_LEN = 8  # lv + 6 radar + bpm
+COND_LEN = 9  # lv + 6 radar + bpm + effector
 PREFIX_LEN = 1 + COND_LEN
 RADAR_SLOTS = range(2, 8)  # positions of the radar tokens within a sequence
+EFF_SLOT = 9               # position of the effector-style token
 
 
 def radar_bucket(v: int) -> int:
@@ -62,12 +66,15 @@ def bpm_bucket(bpm: float) -> int:
     return max(0, min(BPM_BUCKETS - 1, round(x * (BPM_BUCKETS - 1))))
 
 
-def cond_tokens(level: float, radar: dict | None, bpm: float) -> list[int]:
+def cond_tokens(level: float, radar: dict | None, bpm: float,
+                eff_id: int | None = None) -> list[int]:
     lv = max(1, min(20, int(level) or 1))
     out = [ID[f"lv_{lv}"]]
     for ax in RADAR_AXES:
         out.append(ID[f"{ax}_{radar_bucket(radar[ax])}"] if radar else UNCOND)
     out.append(ID[f"bpm_{bpm_bucket(bpm)}"])
+    out.append(ID[f"eff_{eff_id}"] if eff_id is not None
+               and 0 <= eff_id < EFF_VOCAB else UNCOND)
     return out
 
 
@@ -126,12 +133,15 @@ def encode(record: dict) -> list[int]:
     return tokens
 
 
-def encode_with_ticks(record: dict) -> tuple[list[int], list[int]]:
-    """-> (tokens, tick-after-token); prefix/EOS positions are 0/end."""
+def encode_with_ticks(record: dict,
+                      eff_map: dict[str, int] | None = None) -> tuple[list[int], list[int]]:
+    """-> (tokens, tick-after-token); prefix/EOS positions are 0/end.
+    eff_map: effector name -> style slot; unmapped effectors get <uncond>."""
     bpm = record["bpm"][1] or record["chart"]["bpms"][0][1]
     radar = record["radar"] if record.get("labeled") else None
+    eff_id = eff_map.get(record.get("effected_by") or "") if eff_map else None
     body, bticks = encode_body(record["chart"])
-    tokens = [BOS] + cond_tokens(record["level"], radar, bpm) + body + [EOS]
+    tokens = [BOS] + cond_tokens(record["level"], radar, bpm, eff_id) + body + [EOS]
     ticks = [0] * PREFIX_LEN + bticks + [bticks[-1] if bticks else 0]
     return tokens, ticks
 

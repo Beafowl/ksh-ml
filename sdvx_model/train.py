@@ -22,12 +22,13 @@ import torch
 from .model import ChartGPT, Config
 from . import tokenizer as tok
 
-CFG_DROP_ALL = 0.10    # replace level+radar with <uncond> (classifier-free guidance)
+CFG_DROP_ALL = 0.10    # replace level+radar+style with <uncond> (classifier-free guidance)
 CFG_DROP_AXIS = 0.05   # additionally drop single radar axes (slider independence)
+EFF_DROP = 0.30        # drop the effector-style token (style stays optional)
 AUDIO_DROP = 0.10      # zero the onset features (keeps song-free generation working)
 MIRROR_P = 0.50        # lane-mirror augmentation (radar labels are symmetric)
 GRID = 12              # ticks per onset cell (matches the dataset's onset_step)
-WINDOW = 16            # onset cells of lookahead per token
+WINDOW = 16            # onset cells of lookahead per token (v4 flat-window mode)
 
 
 def _mirror_perm() -> np.ndarray:
@@ -58,23 +59,41 @@ MIRROR = _mirror_perm()
 
 class ChartData:
     def __init__(self, path: str, ctx: int, audio_dim: int, val_mod: int = 20,
-                 mel_pack: str | None = None):
+                 mel_pack: str | None = None, enc_mode: bool = False,
+                 max_cells: int = 4096):
         self.ctx = ctx
         self.audio_dim = audio_dim
+        self.enc_mode = enc_mode
+        self.max_cells = max_cells
         self.mels = None
         if mel_pack:
             z = np.load(mel_pack)
             self.mels = {k: z[k] for k in z.files}  # id("|"-separated) -> (cells, 64) u8
             print(f"  mel pack: {len(self.mels)} charts")
-        self.train, self.val = [], []
+        # effector-style vocabulary: top-N effectors by chart count
         from collections import Counter
+        eff_count: Counter = Counter()
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                eff = json.loads(line).get("effected_by") or ""
+                if eff:
+                    eff_count[eff] += 1
+        self.eff_names = [n for n, _ in eff_count.most_common(tok.EFF_VOCAB)]
+        self.eff_map = {n: i for i, n in enumerate(self.eff_names)}
+        covered = sum(eff_count[n] for n in self.eff_names)
+        print(f"  effectors: {len(eff_count)} unique, top-{len(self.eff_names)} "
+              f"cover {covered} charts")
+        self.train, self.val = [], []
         lvl_count: Counter = Counter()
         with gzip.open(path, "rt", encoding="utf-8") as f:
             for line in f:
                 r = json.loads(line)
-                tokens, ticks = tok.encode_with_ticks(r)
+                tokens, ticks = tok.encode_with_ticks(r, self.eff_map)
                 onset = None
-                if self.mels is not None:
+                if self.enc_mode:
+                    mel = self.mels.get(r["id"].replace("/", "|")) if self.mels else None
+                    onset = mel[:max_cells] if mel is not None else None  # raw (N,64) u8
+                elif self.mels is not None:
                     mel = self.mels.get(r["id"].replace("/", "|"))
                     if mel is not None:
                         onset = np.concatenate(
@@ -117,8 +136,9 @@ class ChartData:
         return out
 
     def sample_batch(self, batch: int, rng: random.Random, train=True):
+        """v4 mode -> (x, y, audio); enc mode -> (x, y, mel, cells, audio_off)."""
         items = self.train if train else self.val
-        xs, ys, aus = [], [], []
+        xs, ys, aus, mels, cellss, aoffs = [], [], [], [], [], []
         for _ in range(batch):
             if train:
                 i = int(np.searchsorted(self.cum_weights, rng.random()))
@@ -135,10 +155,13 @@ class ChartData:
             if train:  # classifier-free guidance dropout
                 if rng.random() < CFG_DROP_ALL:
                     prefix[1:1 + 7] = tok.UNCOND  # level + radar
+                    prefix[tok.EFF_SLOT] = tok.UNCOND
                 else:
                     for slot in tok.RADAR_SLOTS:
                         if rng.random() < CFG_DROP_AXIS:
                             prefix[slot] = tok.UNCOND
+                    if rng.random() < EFF_DROP:
+                        prefix[tok.EFF_SLOT] = tok.UNCOND
             body_ctx = self.ctx + 1 - len(prefix)
             if len(body) > body_ctx:
                 start = rng.randrange(len(body) - body_ctx + 1) if train else 0
@@ -150,16 +173,34 @@ class ChartData:
             if pad > 0:
                 x = np.concatenate([x, np.full(pad, tok.PAD, dtype=np.int64)])
                 ticks_x = np.concatenate([ticks_x, np.full(pad, ticks_x[-1], dtype=np.int32)])
-            au = self._audio_feats(it, ticks_x[:-1])
-            if train and rng.random() < AUDIO_DROP:
-                au = np.zeros_like(au)
+            if self.enc_mode:
+                n = len(it["onset"]) if it["onset"] is not None else 1
+                cells = np.minimum(ticks_x[:-1] // GRID, min(n, self.max_cells) - 1)
+                cellss.append(np.maximum(cells, 0).astype(np.int64))
+                mels.append(it["onset"])
+                aoffs.append(it["onset"] is None
+                             or (train and rng.random() < AUDIO_DROP))
+            else:
+                au = self._audio_feats(it, ticks_x[:-1])
+                if train and rng.random() < AUDIO_DROP:
+                    au = np.zeros_like(au)
+                aus.append(au)
             xs.append(x[:-1])
             y = x[1:].copy()
             y[y == tok.PAD] = -100
             ys.append(y)
-            aus.append(au)
-        return (torch.from_numpy(np.stack(xs)), torch.from_numpy(np.stack(ys)),
-                torch.from_numpy(np.stack(aus)))
+        x_t = torch.from_numpy(np.stack(xs))
+        y_t = torch.from_numpy(np.stack(ys))
+        if not self.enc_mode:
+            return x_t, y_t, torch.from_numpy(np.stack(aus))
+        n_max = max(1, max((len(m) for m in mels if m is not None), default=1))
+        mel_t = np.zeros((batch, n_max, 64), dtype=np.float32)
+        for i, m in enumerate(mels):
+            if m is not None:
+                mel_t[i, :len(m)] = m.astype(np.float32) / 255.0
+        return (x_t, y_t, torch.from_numpy(mel_t),
+                torch.from_numpy(np.stack(cellss)),
+                torch.tensor(aoffs, dtype=torch.bool))
 
 
 def main():
@@ -181,6 +222,13 @@ def main():
     ap.add_argument("--audio-dim", type=int, default=64, help="16 cells x features/cell; 0 disables audio")
     ap.add_argument("--mel-pack", default=None,
                     help="mels.npz from the dataset build; switches to the learned mel encoder (audio-dim becomes 16*64)")
+    ap.add_argument("--enc-layer", type=int, default=0,
+                    help=">0: v5 audio encoder + cross-attention (requires --mel-pack)")
+    ap.add_argument("--enc-embd", type=int, default=256)
+    ap.add_argument("--enc-head", type=int, default=4)
+    ap.add_argument("--cross-window", type=int, default=16)
+    ap.add_argument("--cross-back", type=int, default=4)
+    ap.add_argument("--max-cells", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--resume", default=None)
     ap.add_argument("--compile", action="store_true")
@@ -194,16 +242,23 @@ def main():
     rng = random.Random(args.seed)
 
     print("loading + tokenizing dataset ...")
+    enc_mode = args.enc_layer > 0
+    if enc_mode and not args.mel_pack:
+        raise SystemExit("--enc-layer requires --mel-pack")
     if args.mel_pack:
         args.audio_dim = WINDOW * 64
-    data = ChartData(args.data, args.ctx, args.audio_dim, mel_pack=args.mel_pack)
+    data = ChartData(args.data, args.ctx, args.audio_dim, mel_pack=args.mel_pack,
+                     enc_mode=enc_mode, max_cells=args.max_cells)
     n_tok = sum(len(it["seq"]) for it in data.train)
     print(f"  train charts: {len(data.train)} ({n_tok/1e6:.1f}M tokens), "
           f"val charts: {len(data.val)}, vocab: {len(tok.VOCAB)}")
 
     cfg = Config(vocab_size=len(tok.VOCAB), ctx=args.ctx, n_layer=args.n_layer,
                  n_head=args.n_head, n_embd=args.n_embd, dropout=args.dropout,
-                 audio_dim=args.audio_dim, mel_bins=64 if args.mel_pack else 0)
+                 audio_dim=args.audio_dim, mel_bins=64 if args.mel_pack else 0,
+                 enc_layer=args.enc_layer, enc_embd=args.enc_embd,
+                 enc_head=args.enc_head, cross_window=args.cross_window,
+                 cross_back=args.cross_back, max_cells=args.max_cells)
     model = ChartGPT(cfg).to(device)
     print(f"  model params: {model.num_params()/1e6:.1f}M")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -233,8 +288,20 @@ def main():
         raw = model._orig_mod if hasattr(model, "_orig_mod") else model
         torch.save({"model": raw.state_dict(), "opt": opt.state_dict(),
                     "step": step, "best_val": best_val, "config": vars(args),
-                    "model_cfg": cfg.__dict__, "vocab": tok.VOCAB},
+                    "model_cfg": cfg.__dict__, "vocab": tok.VOCAB,
+                    "eff_names": data.eff_names},
                    os.path.join(args.out, name))
+
+    def run_model(batch_data):
+        if enc_mode:
+            x, y, mel, cells, aoff = (t.to(device) for t in batch_data)
+            with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+                _, loss = model(x, y, mel=mel, cells=cells, audio_off=aoff)
+        else:
+            x, y, a = (t.to(device) for t in batch_data)
+            with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
+                _, loss = model(x, y, audio=a)
+        return loss, x.numel()
 
     @torch.no_grad()
     def evaluate():
@@ -242,10 +309,7 @@ def main():
         vrng = random.Random(0)
         losses = []
         for _ in range(args.eval_batches):
-            x, y, a = data.sample_batch(args.batch, vrng, train=False)
-            x, y, a = x.to(device), y.to(device), a.to(device)
-            with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
-                _, loss = model(x, y, audio=a)
+            loss, _ = run_model(data.sample_batch(args.batch, vrng, train=False))
             losses.append(loss.item())
         model.train()
         return sum(losses) / len(losses)
@@ -258,13 +322,10 @@ def main():
         opt.zero_grad(set_to_none=True)
         total = 0.0
         for _ in range(args.accum):
-            x, y, a = data.sample_batch(args.batch, rng)
-            x, y, a = x.to(device), y.to(device), a.to(device)
-            with torch.autocast(device, dtype=torch.bfloat16, enabled=use_bf16):
-                _, loss = model(x, y, audio=a)
+            loss, n = run_model(data.sample_batch(args.batch, rng))
             (loss / args.accum).backward()
             total += loss.item() / args.accum
-            tok_count += x.numel()
+            tok_count += n
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
 

@@ -20,6 +20,14 @@ class Config:
     audio_dim: int = 16   # flattened per-token audio input; 0 = no audio
     mel_bins: int = 0     # >0: input is (window x mel_bins) and a learned
                           # per-cell encoder replaces the flat projection
+    # v5: bidirectional audio encoder + windowed cross-attention read.
+    # enc_layer > 0 switches to (mel, cells) conditioning; audio_dim ignored.
+    enc_layer: int = 0
+    enc_embd: int = 256
+    enc_head: int = 4
+    cross_window: int = 16  # memory cells each token reads
+    cross_back: int = 4     # of which this many lie behind the token
+    max_cells: int = 4096   # encoder position-embedding capacity
 
 
 class Block(nn.Module):
@@ -63,13 +71,100 @@ class Block(nn.Module):
         return x, (k, v)
 
 
+class EncBlock(nn.Module):
+    """Bidirectional pre-LN transformer block for the audio encoder."""
+
+    def __init__(self, d: int, n_head: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.proj = nn.Linear(d, d, bias=False)
+        self.ln2 = nn.LayerNorm(d)
+        self.mlp = nn.Sequential(
+            nn.Linear(d, 4 * d, bias=False),
+            nn.GELU(),
+            nn.Linear(4 * d, d, bias=False),
+        )
+        self.n_head = n_head
+        self.dropout = dropout
+
+    def forward(self, x):
+        b, t, c = x.shape
+        q, k, v = self.qkv(self.ln1(x)).split(c, dim=2)
+        q = q.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
+        k = k.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
+        v = v.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)
+        a = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        x = x + self.proj(a.transpose(1, 2).contiguous().view(b, t, c))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class AudioEncoder(nn.Module):
+    """Whole-song mel cells (B,N,mel_bins) -> contextual memory (B,N,enc_embd)."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.inp = nn.Linear(cfg.mel_bins, cfg.enc_embd)
+        self.pos = nn.Parameter(torch.zeros(1, cfg.max_cells, cfg.enc_embd))
+        self.blocks = nn.ModuleList(
+            EncBlock(cfg.enc_embd, cfg.enc_head, cfg.dropout)
+            for _ in range(cfg.enc_layer))
+        self.ln = nn.LayerNorm(cfg.enc_embd)
+
+    def forward(self, mel):
+        x = self.inp(mel) + self.pos[:, :mel.shape[1]]
+        for blk in self.blocks:
+            x = blk(x)
+        return self.ln(x)
+
+
+class CrossRead(nn.Module):
+    """Per-token attention read over a window of encoder memory around the
+    token's grid cell. Query comes from the token embedding; a learned
+    relative-cell embedding is added to the gathered memory. With zeroed
+    memory (audio-free rows) the read degrades to a learned null vector,
+    identically in training and inference."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.W, self.back, self.nh = cfg.cross_window, cfg.cross_back, cfg.n_head
+        self.ln_q = nn.LayerNorm(cfg.n_embd)
+        self.q = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.kv = nn.Linear(cfg.enc_embd, 2 * cfg.n_embd, bias=False)
+        self.rel = nn.Parameter(torch.zeros(cfg.cross_window, cfg.enc_embd))
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+
+    def forward(self, x, memory, cells):
+        # x (B,S,C), memory (B,N,E), cells (B,S) int64
+        B, S, C = x.shape
+        N, E = memory.shape[1], memory.shape[2]
+        idx = cells[:, :, None] - self.back + torch.arange(
+            self.W, device=cells.device)[None, None, :]
+        idx = idx.clamp(0, N - 1).reshape(B, S * self.W, 1).expand(-1, -1, E)
+        mem = memory.gather(1, idx).reshape(B, S, self.W, E) + self.rel
+        k, v = self.kv(mem).split(C, dim=-1)
+        hd = C // self.nh
+        q = self.q(self.ln_q(x)).view(B, S, self.nh, hd)
+        k = k.view(B, S, self.W, self.nh, hd)
+        v = v.view(B, S, self.W, self.nh, hd)
+        att = torch.einsum("bshd,bswhd->bshw", q, k) / math.sqrt(hd)
+        out = torch.einsum("bshw,bswhd->bshd", att.softmax(dim=-1), v)
+        return self.proj(out.reshape(B, S, C))
+
+
 class ChartGPT(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.pos_emb = nn.Parameter(torch.zeros(1, cfg.ctx, cfg.n_embd))
-        if cfg.mel_bins:
+        if cfg.enc_layer:
+            self.encoder = AudioEncoder(cfg)
+            self.cross = CrossRead(cfg)
+            self.audio_proj = None
+        elif cfg.mel_bins:
             # learned audio encoder: shared per-cell MLP over mel bins, then a
             # projection over the flattened lookahead window
             cells = cfg.audio_dim // cfg.mel_bins
@@ -97,10 +192,20 @@ class ChartGPT(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, targets=None, audio=None):
+    def forward(self, idx, targets=None, audio=None, mel=None, cells=None,
+                memory=None, audio_off=None):
+        """v4 path: audio (B,S,audio_dim). v5 path (enc_layer>0): mel (B,N,bins)
+        or precomputed memory (B,N,enc_embd), plus cells (B,S) grid indices;
+        audio_off (B,) bool zeroes a row's memory (the audio-free CFG row)."""
         b, t = idx.shape
         x = self.tok_emb(idx) + self.pos_emb[:, :t]
-        if audio is not None and self.audio_proj is not None:
+        if self.cfg.enc_layer and cells is not None:
+            if memory is None:
+                memory = self.encoder(mel)
+            if audio_off is not None:
+                memory = memory * (~audio_off).to(memory.dtype)[:, None, None]
+            x = x + self.cross(x, memory, cells)
+        elif audio is not None and self.audio_proj is not None:
             x = x + self.audio_proj(audio)
         x = self.drop(x)
         for blk in self.blocks:
@@ -117,14 +222,17 @@ class ChartGPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def forward_kv(self, idx, audio, attn_mask, past):
-        """Incremental forward for export/inference. idx (B,S); audio (B,S,A);
+    def forward_kv(self, idx, audio, attn_mask, past, memory=None, cells=None):
+        """Incremental forward for export/inference. idx (B,S); audio (B,S,A)
+        for v4 models, or memory (B,N,E) + cells (B,S) for v5 models;
         attn_mask additive (B,1,S,P+S); past: list of n_layer (k,v) tensors
         with P=0 allowed. Returns (logits, presents)."""
         b, s = idx.shape
         p = past[0][0].shape[2]
         x = self.tok_emb(idx) + self.pos_emb[:, p:p + s]
-        if audio is not None and self.audio_proj is not None:
+        if self.cfg.enc_layer and cells is not None:
+            x = x + self.cross(x, memory, cells)
+        elif audio is not None and self.audio_proj is not None:
             x = x + self.audio_proj(audio)
         presents = []
         for blk, pkv in zip(self.blocks, past):

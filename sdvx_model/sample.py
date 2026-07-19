@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--guidance", type=float, default=2.0)
     ap.add_argument("--audio-guidance", type=float, default=2.5)
+    ap.add_argument("--style", default=None,
+                    help="effector name (or substring) for style conditioning (v5)")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -65,16 +67,28 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
     ck = torch.load(args.ckpt, map_location=device)
-    if ck["vocab"] != tok.VOCAB:
+    if ck["vocab"] != tok.VOCAB[:len(ck["vocab"])]:
         raise SystemExit("checkpoint vocab differs from current tokenizer")
+    has_eff = any(n.startswith("eff_") for n in ck["vocab"])
     model = ChartGPT(Config(**ck["model_cfg"])).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
+    enc_mode = model.cfg.enc_layer > 0
     audio_dim = model.cfg.audio_dim
-    feats_per_cell = max(1, audio_dim // WINDOW)
+    feats_per_cell = 64 if enc_mode else max(1, audio_dim // WINDOW)
+
+    eff_id = None
+    if args.style:
+        names = ck.get("eff_names") or []
+        hits = [i for i, n in enumerate(names)
+                if args.style.lower() in n.lower()]
+        if not hits:
+            raise SystemExit(f"--style {args.style!r} not in checkpoint styles")
+        eff_id = hits[0]
+        print(f"style: {names[eff_id]} (slot {eff_id})")
 
     n_cells = args.measures * tok.MEASURE // GRID + 1
-    have_audio = bool(args.audio and audio_dim)
+    have_audio = bool(args.audio and (audio_dim or enc_mode))
     if have_audio:
         feats = song_features(args.audio, args.bpm, args.offset, n_cells, feats_per_cell)
         print(f"audio: {args.audio} -> {n_cells} cells x {feats_per_cell} features")
@@ -87,12 +101,27 @@ def main():
 
     radar = {ax: round(max(0.0, min(1.0, getattr(args, ax.replace("-", "_")))) * 200)
              for ax in tok.RADAR_AXES}
-    cond = [tok.BOS] + tok.cond_tokens(args.level, radar, args.bpm)
-    uncond = [tok.BOS, cond[1]] + [tok.UNCOND] * 6 + [cond[8]]
+    cond = [tok.BOS] + tok.cond_tokens(args.level, radar, args.bpm, eff_id)
+    uncond = [tok.BOS, cond[1]] + [tok.UNCOND] * 6 + [cond[8], tok.UNCOND]
+    if not has_eff:  # v4 checkpoint: no effector slot in the prefix
+        cond, uncond = cond[:9], uncond[:9]
     gr, ga = args.guidance, args.audio_guidance
     # rows: 0 = radar+audio, 1 = no radar, 2 = no audio (only when audio is on)
     rows_cond = [cond, uncond] + ([cond] if have_audio else [])
     B = len(rows_cond)
+    PL = len(cond)
+
+    memory = None
+    if enc_mode:
+        mel = torch.from_numpy(
+            feats[:min(n_cells, model.cfg.max_cells)]).float()[None].to(device)
+        with torch.no_grad():
+            memory = model.encoder(mel).repeat(B, 1, 1)
+        if have_audio and B == 3:
+            memory[2] = 0.0  # the audio-free row
+        elif not have_audio:
+            memory[:] = 0.0
+        n_mem = memory.shape[1]
 
     body: list[int] = []
     pos = 0
@@ -102,15 +131,20 @@ def main():
         while len(body) < args.max_tokens and pos < args.measures * tok.MEASURE:
             seqs = [rc + body for rc in rows_cond]
             idx = torch.tensor([s[-model.cfg.ctx:] for s in seqs], device=device)
-            au = None
-            if audio_dim:
-                w = np.stack([window(0)] * tok.PREFIX_LEN
-                             + [window(p) for p in _positions(body)])[-model.cfg.ctx:]
-                a = np.stack([w] * B)
-                if have_audio:
-                    a[2] = 0.0  # the audio-free row
-                au = torch.from_numpy(a).to(device)
-            logits, _ = model(idx, audio=au)
+            if enc_mode:
+                cl = [0] * PL + [min(p // GRID, n_mem - 1) for p in _positions(body)]
+                cells = torch.tensor([cl[-model.cfg.ctx:]] * B, device=device)
+                logits, _ = model(idx, memory=memory, cells=cells)
+            else:
+                au = None
+                if audio_dim:
+                    w = np.stack([window(0)] * PL
+                                 + [window(p) for p in _positions(body)])[-model.cfg.ctx:]
+                    a = np.stack([w] * B)
+                    if have_audio:
+                        a[2] = 0.0  # the audio-free row
+                    au = torch.from_numpy(a).to(device)
+                logits, _ = model(idx, audio=au)
             lg = logits[:, -1, :]
             if have_audio:
                 mixed = lg[0] + (gr - 1) * (lg[0] - lg[1]) + (ga - 1) * (lg[0] - lg[2])
