@@ -190,6 +190,10 @@ def main():
     if ck["vocab"] != tok.VOCAB:
         raise SystemExit("checkpoint vocab differs from tokenizer")
 
+    if cfg.enc_layer:
+        export_v5(model, cfg, ck, args)
+        return
+
     nl, nh, hd = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head
     wrapper = KVWrapper(model)
 
