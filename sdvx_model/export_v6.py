@@ -148,7 +148,7 @@ def main():
     ft = np.float16 if args.fp16 else np.float32
     es = ort.InferenceSession(enc_out, providers=["CPUExecutionProvider"])
     ecross = es.run(None, {"mel": mel.numpy().astype(ft)})
-    ref_cross = [t.numpy() for t in cross]
+    ref_cross = [t.detach().numpy() for t in cross]
     err_e = max(np.abs(ref_cross[i] - ecross[i].astype(np.float32)).max() for i in range(2 * nl))
     print(f"encoder cross-KV parity: max |d| = {err_e:.2e}")
 
