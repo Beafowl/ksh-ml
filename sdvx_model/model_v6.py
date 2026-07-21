@@ -60,10 +60,12 @@ class MHA(nn.Module):
     def _split(self, x, b, t):
         return x.view(b, t, self.n_head, -1).transpose(1, 2)
 
-    def forward(self, x, ctx=None, causal=False, past_kv=None, cache_kv=None):
+    def forward(self, x, ctx=None, causal=False, past_kv=None, cache_kv=None,
+                attn_mask=None):
         """x: (B,T,D) query source. ctx: cross-attn keys source (else self).
         past_kv: (k,v) to prepend (self-attn incremental).
         cache_kv: precomputed (k,v) for cross-attn (skip k/v projection).
+        attn_mask: explicit additive mask; overrides is_causal (export path).
         Returns (out, (k,v)) where (k,v) is the full key/value used."""
         b, t, d = x.shape
         q = self._split(self.q(x), b, t)
@@ -76,9 +78,12 @@ class MHA(nn.Module):
             if past_kv is not None:
                 k = torch.cat([past_kv[0], k], dim=2)
                 v = torch.cat([past_kv[1], v], dim=2)
-        a = F.scaled_dot_product_attention(
-            q, k, v, is_causal=causal and past_kv is None and cache_kv is None,
-            dropout_p=self.dropout if self.training else 0.0)
+        if attn_mask is not None:
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            a = F.scaled_dot_product_attention(
+                q, k, v, is_causal=causal and past_kv is None and cache_kv is None,
+                dropout_p=self.dropout if self.training else 0.0)
         a = a.transpose(1, 2).contiguous().view(b, t, d)
         return self.o(a), (k, v)
 
@@ -182,16 +187,18 @@ class ChartV6(nn.Module):
             cache.append((k, v))
         return cache
 
-    def decode_step(self, idx, cross, self_past, pos):
+    def decode_step(self, idx, cross, self_past, pos, self_mask=None):
         """One/few-token decode. idx (B,S); cross: per-layer (k,v);
         self_past: per-layer (k,v) or None; pos: start position for pos emb.
-        Returns (logits, new_self_past)."""
+        self_mask: explicit additive self-attn mask (export path; overrides
+        the default causal masking). Returns (logits, new_self_past)."""
         b, s = idx.shape
         x = self.tok_emb(idx) + self.dec_pos[:, pos:pos + s]
         new_past = []
         for i, blk in enumerate(self.dec):
             h, self_kv = blk.self_attn(blk.ln1(x), causal=True,
-                                       past_kv=self_past[i] if self_past else None)
+                                       past_kv=self_past[i] if self_past else None,
+                                       attn_mask=self_mask)
             x = x + h
             h, _ = blk.cross_attn(blk.ln2(x), cache_kv=cross[i])
             x = x + h
