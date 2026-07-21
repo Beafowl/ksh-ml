@@ -76,10 +76,20 @@ class WindowData:
                     continue
                 tokens, ticks = tk.encode_with_ticks(r, eff_map)
                 bpm = (r.get("bpm") or [None, 120])[1] or r["chart"]["bpms"][0][1]
+                # keep only note/hold events (with absolute ticks); the delta/bar
+                # tokens are regenerated per window so they aren't double-counted
+                body = tokens[tk.PREFIX_LEN:-1]
+                bt = ticks[tk.PREFIX_LEN:-1]
+                ev_ticks, ev_toks = [], []
+                for tokn, tkk in zip(body, bt):
+                    nm = tk.VOCAB[tokn]
+                    if nm == "bar" or nm.startswith("d_"):
+                        continue
+                    ev_ticks.append(tkk); ev_toks.append(tokn)
                 item = {
                     "prefix": np.array(tokens[:tk.PREFIX_LEN], np.int64),
-                    "body": np.array(tokens[tk.PREFIX_LEN:-1], np.int64),   # drop EOS
-                    "bticks": np.array(ticks[tk.PREFIX_LEN:-1], np.int32),
+                    "ev_ticks": np.array(ev_ticks, np.int32),
+                    "ev_toks": np.array(ev_toks, np.int64),
                     "bpm": float(bpm),
                     "offset_ms": float(r.get("offset_ms") or 0),
                     "frame0": fi[0], "nframes": fi[1],
@@ -93,8 +103,8 @@ class WindowData:
         r = rng.choice(RATES) if train else 1.0
         ms_per_tick = 60000.0 / bpm / 48.0
         win_ticks = int(WINDOW_MS * r / ms_per_tick)
-        body, bticks = it["body"], it["bticks"]
-        last_tick = int(bticks[-1]) if len(bticks) else 0
+        ev_ticks, ev_toks = it["ev_ticks"], it["ev_toks"]
+        last_tick = int(ev_ticks[-1]) if len(ev_ticks) else 0
         if last_tick <= 0:
             start_tick = 0
         else:
@@ -102,13 +112,11 @@ class WindowData:
             start_tick = rng.randrange(0, hi) if train else 0
             start_tick -= start_tick % tk.MEASURE  # measure-align
         end_tick = start_tick + win_ticks
-        # events in [start_tick, end_tick)
-        lo = int(np.searchsorted(bticks, start_tick, "left"))
-        hi = int(np.searchsorted(bticks, end_tick, "left"))
-        seg_body = body[lo:hi]
-        seg_ticks = bticks[lo:hi]
-        # delta-encode from start_tick -> reuse encoder by rebuilding deltas
-        toks = self._deltas(start_tick, seg_body, seg_ticks)
+        # note/hold events in [start_tick, end_tick), delta-encoded from start
+        lo = int(np.searchsorted(ev_ticks, start_tick, "left"))
+        hi = int(np.searchsorted(ev_ticks, end_tick, "left"))
+        seg = list(zip(ev_ticks[lo:hi].tolist(), ev_toks[lo:hi].tolist()))
+        toks = self._deltas(start_tick, seg)
 
         # audio: original ms span [w0, w0 + WINDOW_MS*r] -> resample to 1600
         w0 = off + start_tick * ms_per_tick
@@ -125,10 +133,11 @@ class WindowData:
         mel = src[pick]
         return it["prefix"].copy(), toks, mel, r
 
-    def _deltas(self, start_tick, seg_body, seg_ticks):
-        out = []
-        pos = start_tick
-        for tok, tick in zip(seg_body.tolist(), seg_ticks.tolist()):
+    def _deltas(self, start_tick, seg):
+        """seg: list of (tick, note/hold token). Emit delta/bar tokens to reach
+        each tick, then the token itself. No double-counting (seg has no deltas)."""
+        out, pos = [], start_tick
+        for tick, tok in seg:
             while pos < tick:
                 nb = (pos // tk.MEASURE + 1) * tk.MEASURE
                 if tick >= nb:

@@ -106,7 +106,9 @@ def main():
     radar = {ax: round(max(0.0, min(1.0, getattr(args, ax.replace("-", "_")))) * 200)
              for ax in tk.RADAR_AXES}
     cond = [tk.BOS] + tk.cond_tokens(args.level, radar, args.bpm, eff_id)
-    uncond = [tk.BOS, cond[1]] + [tk.UNCOND] * 6 + [cond[8], cond[9]]
+    # uncond must match training's CFG_DROP_ALL: drop level+radar+effector,
+    # keep bpm (index 8)
+    uncond = [tk.BOS, tk.UNCOND] + [tk.UNCOND] * 6 + [cond[8], tk.UNCOND]
     gr, ga = args.guidance, args.audio_guidance
 
     end_ms = args.offset + args.measures * tk.MEASURE / 48.0 * (60000.0 / args.bpm)
